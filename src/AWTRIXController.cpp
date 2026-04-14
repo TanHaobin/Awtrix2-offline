@@ -157,6 +157,19 @@ bool clockMode = false;           // 是否处于时钟模式（无服务器连�
 bool ntpSynced = false;           // NTP 是否已同步
 bool wifiConnected = false;       // WiFi 是否已连接
 unsigned long lastClockDraw = 0;  // 上次绘制时钟的时间
+
+// ====== App 切换 ======
+const int APP_COUNT = 2;          // 总共 2 个 app：0=时钟, 1=日历
+int currentApp = 0;               // 当前显示的 app
+unsigned long lastAppSwitch = 0;  // 上次自动切换 app 的时间
+const unsigned long APP_SWITCH_INTERVAL = 10000;  // 10 秒自动切换
+bool manualSwitch = false;        // 手动切换后重置自动计时器
+
+// ====== 亮度控制 ======
+int currentBrightness = 30;       // 当前亮度 (1-255)
+const int BRIGHTNESS_STEP = 15;   // 每次调整的步长
+const int MIN_BRIGHTNESS = 5;
+const int MAX_BRIGHTNESS = 255;
 unsigned long wifiRetryTime = 0;  // 下次尝试 WiFi 重连时间
 unsigned long ntpCheckTime = 0;   // 上次检查 NTP 时间
 const int WIFI_RETRY_INTERVAL = 30000;  // WiFi 重试间隔 30s
@@ -305,6 +318,11 @@ class Mp3Notify
 CRGB leds[256];
 FastLED_NeoMatrix *matrix;
 
+// 显示刷新（dithering 已禁用，不需要额外处理）
+inline void matrixShow() {
+	FastLED.show();
+}
+
 static byte c1; // Last character buffer
 byte utf8ascii(byte ascii)
 {
@@ -363,85 +381,185 @@ bool saveConfig()
 	return true;
 }
 
-// FASTLED_ALLOW_INTERRUPTS=0 已在 platformio.ini 中设置，
-// show() 期间 WiFi 中断不会打断 WS2812 时序，第一个 LED 不会再闪烁
-void safeShow()
-{
-	FastLED.show();
+// ====== AWTRIX3 风格 3x5 大数字字模 (0-9) ======
+// 每个数字 3 像素宽 x 5 像素高，每行用 3 bit 表示
+const uint8_t bigDigits[10][5] = {
+	{0b111, 0b101, 0b101, 0b101, 0b111}, // 0
+	{0b010, 0b110, 0b010, 0b010, 0b111}, // 1
+	{0b111, 0b001, 0b111, 0b100, 0b111}, // 2
+	{0b111, 0b001, 0b111, 0b001, 0b111}, // 3
+	{0b101, 0b101, 0b111, 0b001, 0b001}, // 4
+	{0b111, 0b100, 0b111, 0b001, 0b111}, // 5
+	{0b111, 0b100, 0b111, 0b101, 0b111}, // 6
+	{0b111, 0b001, 0b001, 0b001, 0b001}, // 7
+	{0b111, 0b101, 0b111, 0b101, 0b111}, // 8
+	{0b111, 0b101, 0b111, 0b001, 0b111}, // 9
+};
+
+// 绘制一个 3x5 大数字，左上角 (x0, y0)，颜色 color
+void drawBigDigit(int x0, int y0, int digit, uint16_t color) {
+	if (digit < 0 || digit > 9) return;
+	for (int row = 0; row < 5; row++) {
+		for (int col = 0; col < 3; col++) {
+			if (bigDigits[digit][row] & (1 << (2 - col))) {
+				matrix->drawPixel(x0 + col, y0 + row, color);
+			}
+		}
+	}
 }
 
-// ====== 时钟显示函数 ======
+// ====== 时钟显示 HH:MM:SS ======
 void drawClock()
 {
 	time_t now = time(nullptr);
 	struct tm *timeinfo = localtime(&now);
 
-	// 如果时间还没有被设置（year < 2020），显示等待画面
 	if (timeinfo->tm_year < 120) {
 		matrix->clear();
 		matrix->setCursor(4, 6);
 		matrix->setTextColor(matrix->Color(100, 100, 100));
-		matrix->print("--:--");
-		safeShow();
+		matrix->print("--:--:--");
+		matrixShow();
 		return;
 	}
 
 	int hours = timeinfo->tm_hour;
 	int minutes = timeinfo->tm_min;
 	int seconds = timeinfo->tm_sec;
-	int weekday = timeinfo->tm_wday; // 0=Sunday
-
-	// 将 Sunday=0 转为 Monday=0 体系
-	int weekdayMon = (weekday == 0) ? 6 : weekday - 1;
 
 	matrix->clear();
 
-	// ---- 绘制时间 HH:MM ----
-	char timeStr[6];
-	sprintf(timeStr, "%02d:%02d", hours, minutes);
+	uint16_t timeColor = matrix->Color(255, 255, 255);
+	uint16_t colonColor = matrix->Color(180, 180, 180);
+	uint16_t secColor = matrix->Color(100, 200, 255);
 
-	// 冒号闪烁：偶数秒显示冒号，奇数秒隐藏
-	char displayStr[6];
+	// HH:MM:SS 全部用 3x5 大数字，冒号两边有间隔
+	// 布局：H(3) 1 H(3) 1 :(1) 1 M(3) 1 M(3) 1 :(1) 1 S(3) 1 S(3) = 27px
+	// 居中 x=(32-27)/2=2
+	int x0 = 2;
+	int y0 = 1;
+	drawBigDigit(x0,       y0, hours / 10, timeColor);   // x=2..4
+	drawBigDigit(x0 + 4,   y0, hours % 10, timeColor);   // x=6..8
+	// 冒号1（闪烁），x=10
 	if (seconds % 2 == 0) {
-		sprintf(displayStr, "%02d:%02d", hours, minutes);
-	} else {
-		sprintf(displayStr, "%02d %02d", hours, minutes);
+		matrix->drawPixel(x0 + 8, y0 + 1, colonColor);
+		matrix->drawPixel(x0 + 8, y0 + 3, colonColor);
 	}
+	drawBigDigit(x0 + 10,  y0, minutes / 10, timeColor); // x=12..14
+	drawBigDigit(x0 + 14,  y0, minutes % 10, timeColor); // x=16..18
+	// 冒号2（闪烁），x=20
+	if (seconds % 2 == 0) {
+		matrix->drawPixel(x0 + 18, y0 + 1, colonColor);
+		matrix->drawPixel(x0 + 18, y0 + 3, colonColor);
+	}
+	drawBigDigit(x0 + 20,  y0, seconds / 10, secColor);  // x=22..24
+	drawBigDigit(x0 + 24,  y0, seconds % 10, secColor);  // x=26..28
 
-	// 时间文字居中显示 (TomThumb 字体每字符宽4像素，含间隔)
-	// "HH:MM" = 5个字符，冒号窄一些，总约 20 像素宽
-	// 在 32 像素宽矩阵上，x=7 基本居中
-	matrix->setCursor(7, 6);
-	matrix->setTextColor(matrix->Color(255, 255, 255));
-	matrix->print(displayStr);
-
-	// ---- 绘制星期指示器（底部第7行）----
-	// 7 个小段，每段 3 像素宽，间隔 1 像素
-	// 从 x=3 开始：3,4,5 | 7,8,9 | 11,12,13 | 15,16,17 | 19,20,21 | 23,24,25 | 27,28,29
+	// 底部第 7 行：星期指示器，鲜艳色/暗淡色对比
+	int weekday = timeinfo->tm_wday;
+	int weekdayMon = (weekday == 0) ? 6 : weekday - 1;
 	for (int i = 0; i < 7; i++) {
-		int startX = 3 + i * 4;
+		int startX = 2 + i * 4;
 		uint16_t color;
 		if (i == weekdayMon) {
-			color = matrix->Color(255, 255, 255);  // 当天白色
+			color = matrix->Color(0, 200, 255);   // 当天：鲜艳青蓝色
 		} else {
-			color = matrix->Color(50, 50, 50);      // 其他天暗灰
+			color = matrix->Color(20, 40, 50);     // 其他：暗淡蓝灰色
 		}
 		matrix->drawPixel(startX, 7, color);
 		matrix->drawPixel(startX + 1, 7, color);
 		matrix->drawPixel(startX + 2, 7, color);
 	}
 
-	// ---- 绘制秒进度条（第0行，从左到右）----
-	// 32 像素对应 60 秒
-	int progressPixels = (seconds * 32) / 60;
-	for (int x = 0; x < 32; x++) {
-		if (x < progressPixels) {
-			matrix->drawPixel(x, 0, matrix->Color(0, 80, 255));  // 蓝色进度
-		}
-		// 不画背景，保持黑色
+	matrixShow();
+}
+
+// ====== 日历显示：左侧红底白字日期 + 右侧年/月滚动 ======
+int calScrollX = 22;
+unsigned long calScrollTime = 0;
+
+void drawCalendar()
+{
+	time_t now = time(nullptr);
+	struct tm *timeinfo = localtime(&now);
+
+	if (timeinfo->tm_year < 120) {
+		matrix->clear();
+		matrix->setCursor(2, 6);
+		matrix->setTextColor(matrix->Color(100, 100, 100));
+		matrix->print("NO DATE");
+		matrixShow();
+		return;
 	}
 
-	safeShow();
+	int year = timeinfo->tm_year + 1900;
+	int month = timeinfo->tm_mon + 1;
+	int day = timeinfo->tm_mday;
+	int weekday = timeinfo->tm_wday;
+	const char* weekNames[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+	matrix->clear();
+
+	// ====== 左侧：9x8 红色正方形 + 底部白边 + 白色大数字日期 ======
+	// 红色背景 x=0..8, y=0..6
+	matrix->fillRect(0, 0, 9, 7, matrix->Color(200, 0, 0));
+	// 底部白边 x=0..8, y=7
+	for (int x = 0; x < 9; x++) {
+		matrix->drawPixel(x, 7, matrix->Color(255, 255, 255));
+	}
+
+	// 白色大数字日期居中在红色区域（y=0..6, 高7px，数字高5px，y=(7-5)/2=1）
+	uint16_t dayColor = matrix->Color(255, 255, 255);
+	drawBigDigit(1, 1, day / 10, dayColor);
+	drawBigDigit(5, 1, day % 10, dayColor);
+
+	// ====== 右侧：年/月/星期 横移滚动 (x=10..31, 22px宽) ======
+	char scrollText[32];
+	sprintf(scrollText, "%04d/%02d %s", year, month, weekNames[weekday]);
+
+	int textLen = strlen(scrollText);
+	int textPixelWidth = textLen * 4;
+
+	// 滚动：每 80ms 移 1px
+	if (millis() - calScrollTime > 80) {
+		calScrollX--;
+		if (calScrollX < -textPixelWidth) {
+			calScrollX = 22;
+		}
+		calScrollTime = millis();
+	}
+
+	// 右侧文字垂直居中：TomThumb 基线在底部，字高5px
+	// 右侧区域高 8px，居中 y_baseline = (8+5)/2 = 6 (基线位置)
+	matrix->setCursor(10 + calScrollX, 6);
+	matrix->setTextColor(matrix->Color(200, 200, 200));
+	matrix->print(scrollText);
+
+	// 重绘左侧红色方块（覆盖可能溢出的文本）
+	matrix->fillRect(0, 0, 9, 7, matrix->Color(200, 0, 0));
+	for (int x = 0; x < 9; x++) {
+		matrix->drawPixel(x, 7, matrix->Color(255, 255, 255));
+	}
+	drawBigDigit(1, 1, day / 10, dayColor);
+	drawBigDigit(5, 1, day % 10, dayColor);
+
+	matrixShow();
+}
+
+// ====== 统一 App 绘制入口 ======
+void drawCurrentApp()
+{
+	switch (currentApp) {
+	case 0:
+		drawClock();
+		break;
+	case 1:
+		drawCalendar();
+		break;
+	default:
+		drawClock();
+		break;
+	}
 }
 
 // 扫描附近 WiFi 并返回最佳开放网络 SSID（优先 Tencent-GuestWiFi，其次信号最强的开放网络）
@@ -536,7 +654,7 @@ void debuggingWithMatrix(String text)
 	matrix->setCursor(7, 6);
 	matrix->clear();
 	matrix->print(text);
-	safeShow();
+	matrixShow();
 }
 
 void sendToServer(String s)
@@ -778,7 +896,7 @@ void hardwareAnimatedUncheck(int typ, int x, int y)
 				break;
 			}
 			wifiCheckPoints++;
-			safeShow();
+			matrixShow();
 			delay(100);
 		}
 	}
@@ -840,7 +958,7 @@ void hardwareAnimatedCheck(MsgType typ, int x, int y)
 				break;
 			}
 			wifiCheckPoints++;
-			safeShow();
+			matrixShow();
 			delay(100);
 		}
 	}
@@ -918,7 +1036,7 @@ void serverSearch(int rounds, int typ, int x, int y)
 			break;
 		}
 	}
-	safeShow();
+	matrixShow();
 }
 
 void hardwareAnimatedSearch(int typ, int x, int y)
@@ -956,7 +1074,7 @@ void hardwareAnimatedSearch(int typ, int x, int y)
 		case 0:
 			break;
 		}
-		safeShow();
+		matrixShow();
 		delay(100);
 	}
 }
@@ -1144,7 +1262,7 @@ void updateMatrix(byte payload[], int length)
 			if (notify){
 				matrix->drawPixel(31, 0, matrix->Color(200,0, 0));
 			}
-			safeShow();
+			matrixShow();
 			break;
 		}
 		case 9:
@@ -1241,7 +1359,7 @@ void updateMatrix(byte payload[], int length)
 			matrix->setCursor(6, 6);
 			matrix->setTextColor(matrix->Color(0, 255, 50));
 			matrix->print("SAVED!");
-			safeShow();
+			matrixShow();
 			delay(2000);
 			if (saveConfig())
 			{
@@ -1256,7 +1374,7 @@ void updateMatrix(byte payload[], int length)
 			matrix->setTextColor(matrix->Color(255, 0, 0));
 			matrix->setCursor(6, 6);
 			matrix->print("RESET!");
-			safeShow();
+			matrixShow();
 			delay(1000);
 			if (LittleFS.begin())
 			{
@@ -1396,7 +1514,7 @@ void updateMatrix(byte payload[], int length)
 					matrix->setCursor(i, 6);
 					matrix->setTextColor(matrix->Color(r, g, b));
 					matrix->print(utf8ascii(tempString));
-					safeShow();
+					matrixShow();
 					client.loop();
 					int endzeit = millis();
 					if ((scrollSpeed + starzeit - endzeit) > 0)
@@ -1461,7 +1579,7 @@ void reconnect()
 		client.subscribe("awtrixmatrix/#");
 		client.publish("matrixClient", "connected");
 		matrix->fillScreen(matrix->Color(0, 0, 0));
-		safeShow();
+		matrixShow();
 	}
 }
 
@@ -1541,7 +1659,7 @@ void flashProgress(unsigned int progress, unsigned int total)
 	matrix->setCursor(1, 6);
 	matrix->setTextColor(matrix->Color(200, 200, 200));
 	matrix->print("FLASHING");
-	safeShow();
+	matrixShow();
 }
 
 void saveConfigCallback()
@@ -1566,7 +1684,7 @@ void configModeCallback(WiFiManager *myWiFiManager)
 	matrix->setCursor(3, 6);
 	matrix->setTextColor(matrix->Color(0, 255, 50));
 	matrix->print("Hotspot");
-	safeShow();
+	matrixShow();
 }
 
 void setup()
@@ -1716,6 +1834,15 @@ void setup()
 	matrix->setBrightness(30);
 	matrix->setFont(&TomThumb);
 
+	// 禁用 FastLED 时序抖动——抖动会导致 leds[0] 即使设为黑色也被微调为非零值
+	// 这是左上角第一个 LED 闪烁的根本原因
+	FastLED.setDither(0);
+
+	// 初始化：先发一帧全黑
+	memset(leds, 0, sizeof(leds));
+	FastLED.show();
+	delay(1);
+
 	//Reset with Tasters...
 	int zeit = millis();
 	int zahl = 5;
@@ -1724,7 +1851,7 @@ void setup()
 	matrix->setCursor(9, 6);
 	matrix->setTextColor(matrix->Color(255, 0, 255));
 	matrix->print("BOOT");
-	safeShow();
+	matrixShow();
 	delay(2000);
 	while (!digitalRead(D4))
 	{
@@ -1735,7 +1862,7 @@ void setup()
 			matrix->setCursor(6, 6);
 			matrix->print("RESET ");
 			matrix->print(zahl);
-			safeShow();
+			matrixShow();
 			zahlAlt = zahl;
 		}
 		zahl = 5 - ((millis() - zeit) / 1000);
@@ -1745,7 +1872,7 @@ void setup()
 			matrix->setTextColor(matrix->Color(255, 0, 0));
 			matrix->setCursor(6, 6);
 			matrix->print("RESET!");
-			safeShow();
+			matrixShow();
 			delay(1000);
 			if (LittleFS.begin())
 			{
@@ -1767,7 +1894,7 @@ void setup()
 			matrix->setTextColor(matrix->Color(255, 0, 0));
 			matrix->setCursor(6, 6);
 			matrix->print("RESET!");
-			safeShow();
+			matrixShow();
 			delay(1000);
 			if (LittleFS.begin())
 			{
@@ -1836,7 +1963,7 @@ void setup()
 			case 0:
 				break;
 			}
-			safeShow();
+			matrixShow();
 			delay(50);
 			yield();
 		}
@@ -1901,7 +2028,7 @@ void setup()
 		matrix->setCursor(2, 6);
 		matrix->setTextColor(matrix->Color(255, 165, 0));  // 橙色
 		matrix->print("OFFLINE");
-		safeShow();
+		matrixShow();
 		delay(1500);
 	}
 
@@ -2038,7 +2165,7 @@ void setup()
 				matrix->setCursor(x, 6);
 				matrix->print("Host-IP: " + String(awtrix_server) + ":" + String(Port));
 				matrix->setTextColor(matrix->Color(0, 255, 50));
-				safeShow();
+				matrixShow();
 				delay(40);
 			}
 			client.setServer(awtrix_server, atoi(Port));
@@ -2057,6 +2184,7 @@ void setup()
 
 	connectionTimout = millis();
 	lastClockDraw = 0;
+	lastAppSwitch = millis();
 	wifiRetryTime = 0;
 
 	Serial.println("[Setup] Complete. Clock mode active.");
@@ -2077,8 +2205,8 @@ void loop()
 		}
 		tryWiFiConnect();
 	} else if (!ntpSynced) {
-		// WiFi 已连接，定期检查 NTP 是否同步了
-		if (millis() - ntpCheckTime > 5000) {
+		// WiFi 已连接，每 5 分钟检查一次 NTP
+		if (millis() - ntpCheckTime > 300000) {
 			ntpCheckTime = millis();
 			if (checkNtpSynced()) {
 				ntpSynced = true;
@@ -2094,50 +2222,29 @@ void loop()
 		}
 	}
 
-	// ====== 时钟显示 ======
-	// 当没有服务器连接（USB 或 MQTT）时，显示时钟
+	// ====== App 显示（时钟/日历轮播） ======
 	bool hasServerConnection = (USBConnection || WIFIConnection) && !firstStart;
 
 	if (!hasServerConnection && !ignoreServer && !updating)
 	{
-		// 每 500ms 刷新一次时钟显示（足够冒号闪烁）
-		if (millis() - lastClockDraw >= 500)
+		// 自动切换 app（每 10 秒）
+		if (millis() - lastAppSwitch >= APP_SWITCH_INTERVAL) {
+			currentApp = (currentApp + 1) % APP_COUNT;
+			lastAppSwitch = millis();
+		}
+
+		// 刷新显示（时钟500ms，日历50ms因为有滚动动画）
+		unsigned long refreshInterval = (currentApp == 1) ? 50 : 500;
+		if (millis() - lastClockDraw >= refreshInterval)
 		{
-			drawClock();
+			drawCurrentApp();
 			lastClockDraw = millis();
 		}
 	}
 
-	// ====== 服务器搜索（只在用户配置了有效服务器时才工作） ======
-	bool hasValidServer = (strcmp(awtrix_server, "0.0.0.0") != 0 && strlen(awtrix_server) > 0);
-	if (wifiConnected && firstStart && !ignoreServer && hasValidServer && !serverSearchGaveUp)
-	{
-		if (millis() - myTime > 500)
-		{
-			serverSearch(myCounter, 0, 28, 0);
-			myCounter++;
-			if (myCounter == 4)
-			{
-				myCounter = 0;
-			}
-			myTime = millis();
-		}
-
-		if (millis() - connectionTimout > 10000 && firstStart)
-		{
-			firstStart = false;
-			serverSearchAttempts++;
-			Serial.printf("[Loop] Server search timeout (#%d/%d)\n", serverSearchAttempts, MAX_SEARCH_ATTEMPTS);
-			if (serverSearchAttempts >= MAX_SEARCH_ATTEMPTS)
-			{
-				serverSearchGaveUp = true;
-				Serial.println("[Loop] Gave up searching for server. Clock-only mode.");
-			}
-		}
-	}
+	// ====== 服务器搜索和 MQTT 已禁用（纯时钟模式）======
 	// 没有有效服务器或已放弃，直接关闭 firstStart
-	else if (firstStart)
-	{
+	if (firstStart) {
 		firstStart = false;
 	}
 
@@ -2211,24 +2318,9 @@ void loop()
 				}
 			}
 		}
-		//Wifi MQTT — 只在有有效服务器且未放弃搜索时才连
-		if (wifiConnected && (WIFIConnection || firstStart))
-		{
-			bool hasValidSvr = (strcmp(awtrix_server, "0.0.0.0") != 0 && strlen(awtrix_server) > 0);
-			if (hasValidSvr && !serverSearchGaveUp && !client.connected())
-			{
-				reconnect();
-				if (WIFIConnection)
-				{
-					USBConnection = false;
-					WIFIConnection = false;
-					firstStart = true;
-				}
-			}
-			else if (client.connected())
-			{
-				client.loop();
-			}
+		// MQTT 已禁用（纯时钟模式），只保留已连接时的 loop
+		if (client.connected()) {
+			client.loop();
 		}
 		//check gesture sensor
 		if (isr_flag == 1)
@@ -2239,16 +2331,84 @@ void loop()
 			attachInterrupt(APDS9960_INT, interruptRoutine, FALLING);
 		}
 
-		if (millis() - connectionTimout > 20000)
-		{
-			bool hasValidSvr = (strcmp(awtrix_server, "0.0.0.0") != 0 && strlen(awtrix_server) > 0);
-			USBConnection = false;
-			WIFIConnection = false;
-			// 只在有有效服务器且未放弃搜索时才重新搜索
-			if (wifiConnected && hasValidSvr && !serverSearchGaveUp) {
-				firstStart = true;
+		// 不再有 20 秒超时重置 firstStart 的逻辑
+		connectionTimout = millis();
+	}
+
+	// ====== 按钮处理：短按切换 app，长按持续调亮度 ======
+	// 只在本地时钟模式下处理（不是连服务器时）
+	static unsigned long leftPressStart = 0;
+	static unsigned long rightPressStart = 0;
+	static unsigned long leftLastBrightnessChange = 0;
+	static unsigned long rightLastBrightnessChange = 0;
+	static bool leftIsDown = false;
+	static bool rightIsDown = false;
+	static bool leftIsLongPress = false;
+	static bool rightIsLongPress = false;
+	static unsigned long btnStartupGuard = 0;
+	if (btnStartupGuard == 0) btnStartupGuard = millis(); // 记录首次进入 loop 的时间
+
+	// 启动后 2 秒内不处理按钮（等引脚电平稳定）
+	if (!hasServerConnection && !updating && (millis() - btnStartupGuard > 2000)) {
+		// D0/D8 按下时读 HIGH（按钮连 VCC + INPUT_PULLUP）
+		bool leftBtn = digitalRead(D8);
+		bool rightBtn = digitalRead(D0);
+
+		// ---- 左键 ----
+		if (leftBtn && !leftIsDown) {
+			leftPressStart = millis();
+			leftIsDown = true;
+			leftIsLongPress = false;
+			leftLastBrightnessChange = 0;
+		}
+		if (leftBtn && leftIsDown && (millis() - leftPressStart > 600)) {
+			leftIsLongPress = true;
+			// 首次触发 + 之后每 2 秒一档
+			if (leftLastBrightnessChange == 0 || (millis() - leftLastBrightnessChange >= 2000)) {
+				currentBrightness = max(MIN_BRIGHTNESS, currentBrightness - BRIGHTNESS_STEP);
+				matrix->setBrightness(currentBrightness);
+				lastClockDraw = 0;
+				leftLastBrightnessChange = millis();
+				Serial.printf("[Button] Brightness down: %d\n", currentBrightness);
 			}
-			connectionTimout = millis();
+		}
+		if (!leftBtn && leftIsDown) {
+			if (!leftIsLongPress) {
+				currentApp = (currentApp - 1 + APP_COUNT) % APP_COUNT;
+				lastAppSwitch = millis();
+				lastClockDraw = 0;
+				calScrollX = 22;
+				Serial.printf("[Button] Left short: app=%d\n", currentApp);
+			}
+			leftIsDown = false;
+		}
+
+		// ---- 右键 ----
+		if (rightBtn && !rightIsDown) {
+			rightPressStart = millis();
+			rightIsDown = true;
+			rightIsLongPress = false;
+			rightLastBrightnessChange = 0;
+		}
+		if (rightBtn && rightIsDown && (millis() - rightPressStart > 600)) {
+			rightIsLongPress = true;
+			if (rightLastBrightnessChange == 0 || (millis() - rightLastBrightnessChange >= 2000)) {
+				currentBrightness = min(MAX_BRIGHTNESS, currentBrightness + BRIGHTNESS_STEP);
+				matrix->setBrightness(currentBrightness);
+				lastClockDraw = 0;
+				rightLastBrightnessChange = millis();
+				Serial.printf("[Button] Brightness up: %d\n", currentBrightness);
+			}
+		}
+		if (!rightBtn && rightIsDown) {
+			if (!rightIsLongPress) {
+				currentApp = (currentApp + 1) % APP_COUNT;
+				lastAppSwitch = millis();
+				lastClockDraw = 0;
+				calScrollX = 22;
+				Serial.printf("[Button] Right short: app=%d\n", currentApp);
+			}
+			rightIsDown = false;
 		}
 	}
 
@@ -2275,7 +2435,7 @@ void loop()
 		matrix->setCursor(1, 6);
 		matrix->setTextColor(matrix->Color(0, 255, 255));
 		matrix->print("WiFi AP");
-		safeShow();
+		matrixShow();
 		delay(1000);
 
 		wifiManager.setAPStaticIPConfig(IPAddress(172, 217, 28, 1), IPAddress(172, 217, 28, 1), IPAddress(255, 255, 255, 0));
@@ -2322,7 +2482,7 @@ void loop()
 			matrix->setCursor(0, 6);
 			matrix->setTextColor(matrix->Color(0, 255, 50));
 			//matrix->print(myMenue.getMenueString(&menuePointer, &pressedTaster, &minBrightness, &maxBrightness));
-			safeShow();
+			matrixShow();
 		}
 
 		//get data and ignore

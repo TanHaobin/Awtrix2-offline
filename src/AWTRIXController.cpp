@@ -318,8 +318,12 @@ class Mp3Notify
 CRGB leds[256];
 FastLED_NeoMatrix *matrix;
 
-// 显示刷新（dithering 已禁用，不需要额外处理）
+// 双次 show：ESP8266 GPIO4 在首次 show 的第一个 bit 可能有干扰脉冲，
+// 第二次 show 时 GPIO 已稳定，数据完全正确。
+// 代价：每帧多 ~8ms（256 LED × 30μs + 300μs reset），肉眼无感。
 inline void matrixShow() {
+	FastLED.show();
+	delayMicroseconds(350);  // WS2812 reset 时间
 	FastLED.show();
 }
 

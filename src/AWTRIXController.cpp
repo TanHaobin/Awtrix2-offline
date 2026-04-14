@@ -363,14 +363,10 @@ bool saveConfig()
 	return true;
 }
 
-// WS2812 LED 链中第一个 LED 可能因 GPIO 信号干扰显示异常,
-// 通过双重 show 确保 leds[0] 被正确清除
+// FASTLED_ALLOW_INTERRUPTS=0 已在 platformio.ini 中设置，
+// show() 期间 WiFi 中断不会打断 WS2812 时序，第一个 LED 不会再闪烁
 void safeShow()
 {
-	leds[0] = CRGB::Black;
-	matrix->show();
-	delayMicroseconds(300);  // 等待 WS2812 latch（>280us）
-	leds[0] = CRGB::Black;
 	FastLED.show();
 }
 
@@ -444,14 +440,6 @@ void drawClock()
 		}
 		// 不画背景，保持黑色
 	}
-
-	// ---- NTP 状态小点 (右上角 x=31, y=0) ----
-	if (ntpSynced) {
-		matrix->drawPixel(31, 0, matrix->Color(0, 200, 0));   // 绿色 = 已同步
-	} else if (wifiConnected) {
-		matrix->drawPixel(31, 0, matrix->Color(200, 200, 0)); // 黄色 = WiFi 已连接但未同步
-	}
-	// 无 WiFi 时不显示小点
 
 	safeShow();
 }
@@ -1156,7 +1144,7 @@ void updateMatrix(byte payload[], int length)
 			if (notify){
 				matrix->drawPixel(31, 0, matrix->Color(200,0, 0));
 			}
-			matrix->show();
+			safeShow();
 			break;
 		}
 		case 9:
@@ -1473,7 +1461,7 @@ void reconnect()
 		client.subscribe("awtrixmatrix/#");
 		client.publish("matrixClient", "connected");
 		matrix->fillScreen(matrix->Color(0, 0, 0));
-		matrix->show();
+		safeShow();
 	}
 }
 
@@ -1779,7 +1767,7 @@ void setup()
 			matrix->setTextColor(matrix->Color(255, 0, 0));
 			matrix->setCursor(6, 6);
 			matrix->print("RESET!");
-			matrix->show();
+			safeShow();
 			delay(1000);
 			if (LittleFS.begin())
 			{

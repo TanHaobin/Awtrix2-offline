@@ -1,7 +1,3 @@
-.pio/
-.pioenvs/
-.piolibdeps/
 .vscode/
-src/awtrix-conf.h
-src/awtrix-conf.h
-src/awtrix-conf.h
+.pio/
+.codebuddy/

@@ -159,7 +159,7 @@ bool wifiConnected = false;       // WiFi 是否已连接
 unsigned long lastClockDraw = 0;  // 上次绘制时钟的时间
 
 // ====== App 切换 ======
-const int APP_COUNT = 2;          // 总共 2 个 app：0=时钟, 1=日历
+const int APP_COUNT = 3;          // 0=时钟, 1=日历, 2=眼睛动画
 int currentApp = 0;               // 当前显示的 app
 unsigned long lastAppSwitch = 0;  // 上次自动切换 app 的时间
 const unsigned long APP_SWITCH_INTERVAL = 10000;  // 10 秒自动切换
@@ -318,12 +318,11 @@ class Mp3Notify
 CRGB leds[256];
 FastLED_NeoMatrix *matrix;
 
-// 双次 show：ESP8266 GPIO4 在首次 show 的第一个 bit 可能有干扰脉冲，
-// 第二次 show 时 GPIO 已稳定，数据完全正确。
-// 代价：每帧多 ~8ms（256 LED × 30μs + 300μs reset），肉眼无感。
+// WS2813 时序比 WS2812(NEOPIXEL) 更宽松（T1=320ns vs 250ns），首 bit 更稳定。
+// 双次 show + WS2813 慢时序：最稳定的组合
 inline void matrixShow() {
 	FastLED.show();
-	delayMicroseconds(350);  // WS2812 reset 时间
+	delayMicroseconds(350);
 	FastLED.show();
 }
 
@@ -550,6 +549,151 @@ void drawCalendar()
 	matrixShow();
 }
 
+// ====== 眼睛动画：可爱的眨眼左右看 ======
+// 动画帧状态
+static unsigned long eyeFrameTime = 0;
+static int eyeFrame = 0;
+static int eyePhase = 0;  // 0=正视 1=眨眼 2=看右 3=看右眨眼 4=看左 5=看左眨眼
+
+// 画一只眼睛：cx,cy=眼框中心, px,py=瞳孔偏移, openness=睁开程度(0-3)
+void drawEye(int cx, int cy, int px, int py, int openness) {
+	uint16_t white = matrix->Color(255, 255, 255);
+	uint16_t iris = matrix->Color(40, 120, 255);   // 蓝色虹膜
+	uint16_t pupil = matrix->Color(0, 0, 0);        // 黑色瞳孔
+	uint16_t lid = matrix->Color(0, 0, 0);           // 眼皮
+
+	if (openness >= 3) {
+		// 完全睁开：6x6 眼白圆角矩形
+		//   ####
+		//  ######
+		//  ######
+		//  ######
+		//  ######
+		//   ####
+		for (int y = -2; y <= 3; y++) {
+			int xstart = (y == -2 || y == 3) ? -1 : -2;
+			int xend   = (y == -2 || y == 3) ?  2 :  3;
+			for (int x = xstart; x <= xend; x++) {
+				matrix->drawPixel(cx + x, cy + y, white);
+			}
+		}
+		// 虹膜 2x2
+		matrix->drawPixel(cx + px,     cy + py,     iris);
+		matrix->drawPixel(cx + px + 1, cy + py,     iris);
+		matrix->drawPixel(cx + px,     cy + py + 1, iris);
+		matrix->drawPixel(cx + px + 1, cy + py + 1, iris);
+		// 瞳孔 1x1 中心
+		matrix->drawPixel(cx + px, cy + py, pupil);
+	} else if (openness == 2) {
+		// 半睁：4行高
+		for (int y = -1; y <= 2; y++) {
+			int xstart = (y == -1 || y == 2) ? -1 : -2;
+			int xend   = (y == -1 || y == 2) ?  2 :  3;
+			for (int x = xstart; x <= xend; x++) {
+				matrix->drawPixel(cx + x, cy + y, white);
+			}
+		}
+		matrix->drawPixel(cx + px,     cy + py,     iris);
+		matrix->drawPixel(cx + px + 1, cy + py,     iris);
+		matrix->drawPixel(cx + px,     cy + py + 1, iris);
+		matrix->drawPixel(cx + px + 1, cy + py + 1, iris);
+		matrix->drawPixel(cx + px, cy + py, pupil);
+	} else if (openness == 1) {
+		// 眯眼：2行
+		for (int x = -2; x <= 3; x++) {
+			matrix->drawPixel(cx + x, cy, white);
+			matrix->drawPixel(cx + x, cy + 1, white);
+		}
+	} else {
+		// 闭眼：1行线
+		for (int x = -2; x <= 3; x++) {
+			matrix->drawPixel(cx + x, cy, white);
+		}
+	}
+}
+
+void drawEyes() {
+	// 动画时间线（每个 phase 持续若干帧，每帧 80ms）
+	// phase 0: 正视 (20帧=1.6s)
+	// phase 1: 眨眼 (5帧=0.4s)
+	// phase 2: 看右 (25帧=2s)
+	// phase 3: 眨眼 (5帧=0.4s)
+	// phase 4: 看左 (25帧=2s)
+	// phase 5: 眨眼 (5帧=0.4s)
+	// 循环
+
+	if (millis() - eyeFrameTime < 80) return;
+	eyeFrameTime = millis();
+	eyeFrame++;
+
+	int phaseDurations[] = {20, 5, 25, 5, 25, 5};
+	int phaseCount = 6;
+
+	int frameInPhase = eyeFrame;
+	eyePhase = 0;
+	for (int i = 0; i < phaseCount; i++) {
+		if (frameInPhase < phaseDurations[i]) {
+			eyePhase = i;
+			break;
+		}
+		frameInPhase -= phaseDurations[i];
+		if (i == phaseCount - 1) {
+			eyeFrame = 0;
+			eyePhase = 0;
+			frameInPhase = 0;
+		}
+	}
+
+	matrix->clear();
+
+	// 两只眼睛中心位置（8x32 矩阵）
+	int leftEyeX = 9;
+	int leftEyeY = 3;
+	int rightEyeX = 22;
+	int rightEyeY = 3;
+
+	int px = 0, py = 0;   // 瞳孔偏移
+	int openness = 3;      // 睁眼程度
+
+	switch (eyePhase) {
+	case 0: // 正视
+		px = 0; py = 0; openness = 3;
+		break;
+	case 1: // 眨眼（正视位置）
+		px = 0; py = 0;
+		if (frameInPhase <= 1) openness = 2;
+		else if (frameInPhase <= 2) openness = 0;
+		else if (frameInPhase <= 3) openness = 2;
+		else openness = 3;
+		break;
+	case 2: // 看右
+		px = 1; py = 0; openness = 3;
+		break;
+	case 3: // 眨眼（看右位置）
+		px = 1; py = 0;
+		if (frameInPhase <= 1) openness = 2;
+		else if (frameInPhase <= 2) openness = 0;
+		else if (frameInPhase <= 3) openness = 2;
+		else openness = 3;
+		break;
+	case 4: // 看左
+		px = -1; py = 0; openness = 3;
+		break;
+	case 5: // 眨眼（看左位置）
+		px = -1; py = 0;
+		if (frameInPhase <= 1) openness = 2;
+		else if (frameInPhase <= 2) openness = 0;
+		else if (frameInPhase <= 3) openness = 2;
+		else openness = 3;
+		break;
+	}
+
+	drawEye(leftEyeX,  leftEyeY,  px, py, openness);
+	drawEye(rightEyeX, rightEyeY, px, py, openness);
+
+	matrixShow();
+}
+
 // ====== 统一 App 绘制入口 ======
 void drawCurrentApp()
 {
@@ -559,6 +703,9 @@ void drawCurrentApp()
 		break;
 	case 1:
 		drawCalendar();
+		break;
+	case 2:
+		drawEyes();
 		break;
 	default:
 		drawClock();
@@ -1766,70 +1913,70 @@ void setup()
 	switch (matrixTempCorrection)
 	{
 	case 0:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setCorrection(TypicalLEDStrip);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setCorrection(TypicalLEDStrip);
 		break;
 	case 1:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(Candle);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(Candle);
 		break;
 	case 2:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(Tungsten40W);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(Tungsten40W);
 		break;
 	case 3:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(Tungsten100W);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(Tungsten100W);
 		break;
 	case 4:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(Halogen);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(Halogen);
 		break;
 	case 5:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(CarbonArc);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(CarbonArc);
 		break;
 	case 6:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(HighNoonSun);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(HighNoonSun);
 		break;
 	case 7:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(DirectSunlight);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(DirectSunlight);
 		break;
 	case 8:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(OvercastSky);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(OvercastSky);
 		break;
 	case 9:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(ClearBlueSky);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(ClearBlueSky);
 		break;
 	case 10:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(WarmFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(WarmFluorescent);
 		break;
 	case 11:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(StandardFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(StandardFluorescent);
 		break;
 	case 12:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(CoolWhiteFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(CoolWhiteFluorescent);
 		break;
 	case 13:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(FullSpectrumFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(FullSpectrumFluorescent);
 		break;
 	case 14:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(GrowLightFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(GrowLightFluorescent);
 		break;
 	case 15:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(BlackLightFluorescent);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(BlackLightFluorescent);
 		break;
 	case 16:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(MercuryVapor);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(MercuryVapor);
 		break;
 	case 17:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(SodiumVapor);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(SodiumVapor);
 		break;
 	case 18:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(MetalHalide);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(MetalHalide);
 		break;
 	case 19:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(HighPressureSodium);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(HighPressureSodium);
 		break;
 	case 20:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setTemperature(UncorrectedTemperature);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setTemperature(UncorrectedTemperature);
 		break;
 	default:
-		FastLED.addLeds<NEOPIXEL, D2>(leds, 256).setCorrection(TypicalLEDStrip);
+		FastLED.addLeds<WS2812, D2, GRB>(leds, 256).setCorrection(TypicalLEDStrip);
 		break;
 	}
 
@@ -2237,8 +2384,8 @@ void loop()
 			lastAppSwitch = millis();
 		}
 
-		// 刷新显示（时钟500ms，日历50ms因为有滚动动画）
-		unsigned long refreshInterval = (currentApp == 1) ? 50 : 500;
+		// 刷新显示（时钟500ms，日历/眼睛50ms因为有动画）
+		unsigned long refreshInterval = (currentApp == 0) ? 500 : 50;
 		if (millis() - lastClockDraw >= refreshInterval)
 		{
 			drawCurrentApp();
@@ -2358,7 +2505,7 @@ void loop()
 		bool leftBtn = digitalRead(D8);
 		bool rightBtn = digitalRead(D0);
 
-		// ---- 左键 ----
+		// ---- 左键（物理）：长按变暗，短按上一个 app ----
 		if (leftBtn && !leftIsDown) {
 			leftPressStart = millis();
 			leftIsDown = true;
@@ -2367,27 +2514,26 @@ void loop()
 		}
 		if (leftBtn && leftIsDown && (millis() - leftPressStart > 600)) {
 			leftIsLongPress = true;
-			// 首次触发 + 之后每 2 秒一档
 			if (leftLastBrightnessChange == 0 || (millis() - leftLastBrightnessChange >= 2000)) {
-				currentBrightness = max(MIN_BRIGHTNESS, currentBrightness - BRIGHTNESS_STEP);
+				currentBrightness = min(MAX_BRIGHTNESS, currentBrightness + BRIGHTNESS_STEP);
 				matrix->setBrightness(currentBrightness);
 				lastClockDraw = 0;
 				leftLastBrightnessChange = millis();
-				Serial.printf("[Button] Brightness down: %d\n", currentBrightness);
+				Serial.printf("[Button] Brightness up: %d\n", currentBrightness);
 			}
 		}
 		if (!leftBtn && leftIsDown) {
 			if (!leftIsLongPress) {
-				currentApp = (currentApp - 1 + APP_COUNT) % APP_COUNT;
+				currentApp = (currentApp + 1) % APP_COUNT;
 				lastAppSwitch = millis();
 				lastClockDraw = 0;
 				calScrollX = 22;
-				Serial.printf("[Button] Left short: app=%d\n", currentApp);
+				Serial.printf("[Button] Left short: next app=%d\n", currentApp);
 			}
 			leftIsDown = false;
 		}
 
-		// ---- 右键 ----
+		// ---- 右键（物理）：长按变亮，短按下一个 app ----
 		if (rightBtn && !rightIsDown) {
 			rightPressStart = millis();
 			rightIsDown = true;
@@ -2397,20 +2543,20 @@ void loop()
 		if (rightBtn && rightIsDown && (millis() - rightPressStart > 600)) {
 			rightIsLongPress = true;
 			if (rightLastBrightnessChange == 0 || (millis() - rightLastBrightnessChange >= 2000)) {
-				currentBrightness = min(MAX_BRIGHTNESS, currentBrightness + BRIGHTNESS_STEP);
+				currentBrightness = max(MIN_BRIGHTNESS, currentBrightness - BRIGHTNESS_STEP);
 				matrix->setBrightness(currentBrightness);
 				lastClockDraw = 0;
 				rightLastBrightnessChange = millis();
-				Serial.printf("[Button] Brightness up: %d\n", currentBrightness);
+				Serial.printf("[Button] Brightness down: %d\n", currentBrightness);
 			}
 		}
 		if (!rightBtn && rightIsDown) {
 			if (!rightIsLongPress) {
-				currentApp = (currentApp + 1) % APP_COUNT;
+				currentApp = (currentApp - 1 + APP_COUNT) % APP_COUNT;
 				lastAppSwitch = millis();
 				lastClockDraw = 0;
 				calScrollX = 22;
-				Serial.printf("[Button] Right short: app=%d\n", currentApp);
+				Serial.printf("[Button] Right short: prev app=%d\n", currentApp);
 			}
 			rightIsDown = false;
 		}
